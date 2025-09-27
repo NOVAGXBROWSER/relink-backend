@@ -1,4 +1,4 @@
-// Minimal RELINK chat prototype
+// Minimal RELINK chat prototype (Render-ready)
 // Backend: Node.js + Express + Socket.IO
 
 const express = require('express');
@@ -60,6 +60,8 @@ io.on('connection', (socket) => {
   });
 });
 
-server.listen(3000, () => {
-  console.log('RELINK backend running on http://localhost:3000');
+// Use Render's PORT environment variable if it exists
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`RELINK backend running on port ${PORT}`);
 });
