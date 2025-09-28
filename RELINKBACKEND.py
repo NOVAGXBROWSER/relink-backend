@@ -38,5 +38,10 @@ def handle_disconnect():
             emit('userList', users, room=room_name)
 
 if __name__ == '__main__':
-
-    socketio.run(app, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    # Add allow_unsafe_werkzeug=True to run on Render
+    socketio.run(
+        app,
+        host='0.0.0.0',
+        port=int(os.environ.get('PORT', 5000)),
+        allow_unsafe_werkzeug=True
+    )
