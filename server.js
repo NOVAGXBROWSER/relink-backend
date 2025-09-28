@@ -10,10 +10,10 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 4000;
 
-// --- In-memory stores for prototype ---
+// --- In-memory stores ---
 const users = {}; // username -> { password, id }
 const sessions = {}; // token -> username
-const messages = []; // { id, username, text, ts }
+const channels = { general: [] }; // channel -> [messages]
 
 // --- REST routes ---
 app.post("/signup", (req, res) => {
@@ -38,14 +38,26 @@ app.post("/login", (req, res) => {
   res.json({ token, username });
 });
 
-app.get("/session/:token", (req, res) => {
-  const username = sessions[req.params.token];
-  if (!username) return res.status(401).json({ error: "invalid session" });
-  res.json({ username });
+// Get messages for a channel
+app.get("/history/:channel", (req, res) => {
+  const ch = req.params.channel;
+  if (!channels[ch]) return res.status(404).json({ error: "channel not found" });
+  res.json(channels[ch].slice(-200));
 });
 
-app.get("/history", (req, res) => {
-  res.json(messages.slice(-200));
+// Create a new channel
+app.post("/channel", (req, res) => {
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ error: "name required" });
+  if (channels[name]) return res.status(409).json({ error: "channel exists" });
+
+  channels[name] = [];
+  res.json({ ok: true, channel: name });
+});
+
+// List channels
+app.get("/channels", (req, res) => {
+  res.json(Object.keys(channels));
 });
 
 // --- Start HTTP server ---
@@ -56,10 +68,12 @@ const server = app.listen(PORT, () =>
 // --- WebSocket server ---
 const wss = new WebSocket.Server({ server });
 
-function broadcast(obj) {
+function broadcast(obj, channel) {
   const raw = JSON.stringify(obj);
   wss.clients.forEach((c) => {
-    if (c.readyState === WebSocket.OPEN) c.send(raw);
+    if (c.readyState === WebSocket.OPEN && (!channel || c.channel === channel)) {
+      c.send(raw);
+    }
   });
 }
 
@@ -81,11 +95,25 @@ wss.on("connection", (ws) => {
         username = sessions[data.token];
       }
       ws.username = username || "anonymous";
+      ws.channel = data.channel || "general";
 
-      const online = Array.from(
-        new Set(Array.from(wss.clients).map((c) => c.username).filter(Boolean))
+      broadcast(
+        {
+          type: "presence",
+          users: Array.from(
+            new Set(
+              Array.from(wss.clients)
+                .filter((c) => c.channel === ws.channel)
+                .map((c) => c.username)
+            )
+          ),
+        },
+        ws.channel
       );
-      broadcast({ type: "presence", users: online });
+    }
+
+    if (data.type === "switch") {
+      ws.channel = data.channel;
     }
 
     if (data.type === "message") {
@@ -93,17 +121,34 @@ wss.on("connection", (ws) => {
       if (data.token && sessions[data.token]) {
         username = sessions[data.token];
       }
-      const msg = { id: uuidv4(), username, text: data.text, ts: Date.now() };
-      messages.push(msg);
-      broadcast({ type: "message", message: msg });
+      const msg = {
+        id: uuidv4(),
+        username,
+        text: data.text,
+        ts: Date.now(),
+        channel: ws.channel || "general",
+      };
+      channels[msg.channel] = channels[msg.channel] || [];
+      channels[msg.channel].push(msg);
+      broadcast({ type: "message", message: msg }, msg.channel);
     }
   });
 
   ws.on("close", () => {
-    const online = Array.from(
-      new Set(Array.from(wss.clients).map((c) => c.username).filter(Boolean))
+    if (!ws.channel) return;
+    broadcast(
+      {
+        type: "presence",
+        users: Array.from(
+          new Set(
+            Array.from(wss.clients)
+              .filter((c) => c.channel === ws.channel)
+              .map((c) => c.username)
+          ),
+        ),
+      },
+      ws.channel
     );
-    broadcast({ type: "presence", users: online });
   });
 });
 
