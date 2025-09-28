@@ -1,5 +1,6 @@
 from flask import Flask, send_from_directory, request
 from flask_socketio import SocketIO, join_room, leave_room, emit
+import os
 
 app = Flask(__name__, static_folder='public')
 socketio = SocketIO(app, cors_allowed_origins="*")  # allow all origins
@@ -37,4 +38,5 @@ def handle_disconnect():
             emit('userList', users, room=room_name)
 
 if __name__ == '__main__':
+
     socketio.run(app, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
