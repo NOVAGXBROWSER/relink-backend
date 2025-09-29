@@ -13,7 +13,8 @@ const PORT = process.env.PORT || 4000;
 // In-memory stores (prototype)
 const users = {};      // username -> { password, id }
 const sessions = {};   // token -> username
-const servers = {};    // serverId -> { id, name, invite, channels: {name: [messages]}, members: Set }
+const servers = {};    // serverId -> { id, name, invite, channels: {name: [messages]}, members: Set, bans: Set }
+const dms = {};        // "alice:bob" -> [ { id, from, to, text, ts } ]
 
 // helpers
 function genInvite(len = 6) {
@@ -23,10 +24,8 @@ function genInvite(len = 6) {
   return s;
 }
 
-function ensureServerData(sid) {
-  if (!servers[sid]) {
-    servers[sid] = { id: sid, name: sid, invite: genInvite(), channels: { general: [] }, members: new Set() };
-  }
+function dmKey(a, b) {
+  return [a, b].sort().join(":"); // ensures same key for both
 }
 
 // --- Auth routes ---
@@ -54,21 +53,17 @@ app.get("/session/:token", (req, res) => {
 });
 
 // --- Server management ---
-// create a new server: { name }
-// returns { id, invite }
 app.post("/server", (req, res) => {
   const { name, token } = req.body;
   if (!name) return res.status(400).json({ error: "name required" });
   const id = uuidv4();
   const invite = genInvite(8);
-  servers[id] = { id, name, invite, channels: { general: [] }, members: new Set() };
-  // add creator as member when token provided
-  if (token && sessions[token]) servers[id].members.add(sessions[token]);
+  const username = token && sessions[token];
+  servers[id] = { id, name, invite, owner: username || null, channels: { general: [] }, members: new Set(), bans: new Set() };
+  if (username) servers[id].members.add(username);
   return res.json({ id, name, invite });
 });
 
-// join server via invite code
-// POST /join/:invite  { token }
 app.post("/join/:invite", (req, res) => {
   const { invite } = req.params;
   const { token } = req.body;
@@ -76,12 +71,11 @@ app.post("/join/:invite", (req, res) => {
   if (!username) return res.status(401).json({ error: "invalid session/token" });
   const sid = Object.keys(servers).find(s => servers[s].invite === invite);
   if (!sid) return res.status(404).json({ error: "invite not found" });
+  if (servers[sid].bans.has(username)) return res.status(403).json({ error: "you are banned" });
   servers[sid].members.add(username);
   return res.json({ ok: true, serverId: sid, name: servers[sid].name });
 });
 
-// list servers current user is a member of
-// GET /servers?token=...
 app.get("/servers", (req, res) => {
   const token = req.query.token;
   const username = token && sessions[token];
@@ -90,14 +84,12 @@ app.get("/servers", (req, res) => {
   res.json(mine);
 });
 
-// list channels for a server
 app.get("/channels/:serverId", (req, res) => {
   const sid = req.params.serverId;
   if (!servers[sid]) return res.status(404).json({ error: "server not found" });
   res.json(Object.keys(servers[sid].channels));
 });
 
-// create channel inside a server
 app.post("/channels/:serverId", (req, res) => {
   const sid = req.params.serverId;
   const { name } = req.body;
@@ -108,7 +100,6 @@ app.post("/channels/:serverId", (req, res) => {
   return res.json({ ok: true, channel: name });
 });
 
-// get history for a channel in a server
 app.get("/history/:serverId/:channel", (req, res) => {
   const { serverId, channel } = req.params;
   if (!servers[serverId]) return res.status(404).json({ error: "server not found" });
@@ -116,16 +107,57 @@ app.get("/history/:serverId/:channel", (req, res) => {
   res.json(servers[serverId].channels[channel].slice(-200));
 });
 
-// debug: list all servers (optional)
-app.get("/debug/servers", (req, res) => {
-  res.json(Object.values(servers).map(s => ({ id: s.id, name: s.name, invite: s.invite, channels: Object.keys(s.channels), members: Array.from(s.members) })));
+// --- DMs ---
+// list users you have DMs with
+app.get("/dms", (req, res) => {
+  const token = req.query.token;
+  const username = token && sessions[token];
+  if (!username) return res.status(401).json({ error: "invalid session" });
+
+  const partners = Object.keys(dms)
+    .filter(k => k.includes(username))
+    .map(k => k.split(":").find(u => u !== username));
+  
+  res.json(partners);
+});
+
+// get DM history with a target
+app.get("/dm/:target", (req, res) => {
+  const token = req.query.token;
+  const username = token && sessions[token];
+  if (!username) return res.status(401).json({ error: "invalid session" });
+
+  const target = req.params.target;
+  const key = dmKey(username, target);
+  res.json(dms[key] || []);
+});
+
+// send a DM
+app.post("/dm/:target", (req, res) => {
+  const { token, text } = req.body;
+  const username = token && sessions[token];
+  if (!username) return res.status(401).json({ error: "invalid session" });
+
+  const target = req.params.target;
+  const key = dmKey(username, target);
+  if (!dms[key]) dms[key] = [];
+
+  const msg = { id: uuidv4(), from: username, to: target, text, ts: Date.now() };
+  dms[key].push(msg);
+
+  wss.clients.forEach(c => {
+    if (c.readyState === 1 && (c.username === username || c.username === target)) {
+      c.send(JSON.stringify({ type: "dm", message: msg }));
+    }
+  });
+
+  res.json({ ok: true, message: msg });
 });
 
 // --- Start server + WebSocket ---
 const server = app.listen(PORT, () => console.log(`RELINK backend on port ${PORT}`));
 const wss = new WebSocket.Server({ server });
 
-// broadcast to sockets matching serverId and optional channel
 function broadcast(obj, serverId = null, channel = null) {
   const raw = JSON.stringify(obj);
   wss.clients.forEach(c => {
@@ -144,10 +176,6 @@ wss.on("connection", ws => {
     let data;
     try { data = JSON.parse(raw); } catch { return; }
 
-    // data.types:
-    // joinServer: { type:'joinServer', token, serverId, channel? }
-    // switchChannel: { type:'switch', channel }
-    // message: { type:'message', token, text }
     if (data.type === "joinServer") {
       const { token, serverId, channel } = data;
       const username = token && sessions[token];
@@ -159,11 +187,14 @@ wss.on("connection", ws => {
         ws.send(JSON.stringify({ type: "error", error: "not a member of server" }));
         return;
       }
+      if (servers[serverId].bans.has(username)) {
+        ws.send(JSON.stringify({ type: "error", error: "you are banned" }));
+        return;
+      }
       ws.username = username;
       ws.serverId = serverId;
       ws.channel = channel || "general";
 
-      // broadcast presence for that server/channel
       const users = Array.from(new Set(
         Array.from(wss.clients)
           .filter(c => c.serverId === ws.serverId && c.channel === ws.channel)
@@ -178,7 +209,6 @@ wss.on("connection", ws => {
       const { channel } = data;
       ws.channel = channel;
       if (!ws.serverId) return;
-      // update presence for new channel
       const users = Array.from(new Set(
         Array.from(wss.clients)
           .filter(c => c.serverId === ws.serverId && c.channel === ws.channel)
@@ -204,6 +234,25 @@ wss.on("connection", ws => {
       broadcast({ type: "message", message: msg }, serverId, channel);
       return;
     }
+
+    if (data.type === "dm") {
+      const { to, text, token } = data;
+      const from = token && sessions[token];
+      if (!from) return;
+
+      const key = dmKey(from, to);
+      if (!dms[key]) dms[key] = [];
+
+      const msg = { id: uuidv4(), from, to, text, ts: Date.now() };
+      dms[key].push(msg);
+
+      wss.clients.forEach(c => {
+        if (c.readyState === 1 && (c.username === from || c.username === to)) {
+          c.send(JSON.stringify({ type: "dm", message: msg }));
+        }
+      });
+      return;
+    }
   });
 
   ws.on("close", () => {
@@ -218,7 +267,6 @@ wss.on("connection", ws => {
   });
 });
 
-// cleanup dead connections
 setInterval(() => {
   wss.clients.forEach(ws => {
     if (!ws.isAlive) return ws.terminate();
